@@ -551,9 +551,12 @@ struct facade_traits<F>
 
 using ptr_prototype = void*[2];
 
+
+// Think this is just a singleton.
 template <class M>
 struct meta_ptr {
   constexpr meta_ptr() noexcept : ptr_(nullptr) {};
+  
   template <class P>
   constexpr explicit meta_ptr(std::in_place_type_t<P>) noexcept
       : ptr_(&storage<P>) {}
@@ -561,10 +564,11 @@ struct meta_ptr {
   void reset() noexcept { ptr_ = nullptr; }
   const M* operator->() const noexcept { return ptr_; }
 
- private:
+// private: // Allow access from outside to support emplacing with address local to current process.
   const M* ptr_;
-  template <class P> static constexpr M storage{std::in_place_type<P>};
+  template <class P> static constexpr M storage{ std::in_place_type<P> };
 };
+
 template <class M>
     requires(sizeof(M) <= sizeof(ptr_prototype) &&
         alignof(M) <= alignof(ptr_prototype) && nullable_traits<M>::applicable)
@@ -572,6 +576,7 @@ struct meta_ptr<M> : M {
   using M::M;
   const M* operator->() const noexcept { return this; }
 };
+
 template <class M>
 struct meta_ptr_reset_guard {
  public:
@@ -587,23 +592,33 @@ template <class F>
 struct proxy_helper {
   static inline const auto& get_meta(const proxy<F>& p) noexcept
       { return *p.meta_.operator->(); }
-  template <class C, qualifier_type Q, class... Args>
-  static decltype(auto) invoke(add_qualifier_t<proxy<F>, Q> p, Args&&... args) {
-    using OverloadTraits = typename conv_traits<C>
-        ::template matched_overload_traits<Q, Args...>;
-    auto dispatcher = p.meta_->template dispatcher_meta<typename OverloadTraits
-        ::template meta_provider<C::is_direct, typename C::dispatch_type>>
-        ::dispatcher;
-    if constexpr (C::is_direct &&
-        OverloadTraits::qualifier == qualifier_type::rv) {
-      meta_ptr_reset_guard guard{p.meta_};
-      return dispatcher(std::forward<add_qualifier_t<std::byte, Q>>(*p.ptr_),
-          std::forward<Args>(args)...);
-    } else {
-      return dispatcher(std::forward<add_qualifier_t<std::byte, Q>>(*p.ptr_),
-          std::forward<Args>(args)...);
+
+
+    template <class C, qualifier_type Q, class... Args>
+    static decltype(auto) invoke(add_qualifier_t<proxy<F>, Q> p, Args&&... args) {
+        
+        using OverloadTraits = typename conv_traits<C>::template matched_overload_traits<Q, Args...>;
+        
+
+        // Segfault was caused by  meta_ptr - it is not mapped into the shared memory page
+
+        auto dispatcher = p.meta_->template dispatcher_meta<
+            typename OverloadTraits::template meta_provider<C::is_direct, typename C::dispatch_type>
+        >::dispatcher;
+
+        if constexpr (C::is_direct && OverloadTraits::qualifier == qualifier_type::rv) {
+            meta_ptr_reset_guard guard{p.meta_};
+            return dispatcher(
+                std::forward<add_qualifier_t<std::byte, Q>>(*p.ptr_),
+                std::forward<Args>(args)...
+            );
+        } else {
+            return dispatcher(
+                std::forward<add_qualifier_t<std::byte, Q>>(*p.ptr_),
+                std::forward<Args>(args)...
+            );
+        }
     }
-  }
   template <class A, qualifier_type Q>
   static add_qualifier_t<proxy<F>, Q> access(add_qualifier_t<A, Q> a) {
     if constexpr (std::is_base_of_v<A, proxy<F>>) {
@@ -637,7 +652,9 @@ template <class F>
 class proxy : public details::facade_traits<F>::direct_accessor {
   static_assert(facade<F>);
   friend struct details::proxy_helper<F>;
-  using _Traits = details::facade_traits<F>;
+
+  public: // Needs to be accessed from the outside too.
+    using _Traits = details::facade_traits<F>;
 
  public:
   proxy() noexcept = default;
@@ -806,11 +823,16 @@ class proxy : public details::facade_traits<F>::direct_accessor {
   friend bool operator==(const proxy& lhs, std::nullptr_t) noexcept
       { return !lhs.has_value(); }
 
- private:
+ //private: // meta_ Needs to be visible from outside.
   template <class P, class... Args>
   P& initialize(Args&&... args) {
     std::construct_at(reinterpret_cast<P*>(ptr_), std::forward<Args>(args)...);
-    meta_ = details::meta_ptr<typename _Traits::meta>{std::in_place_type<P>};
+
+    // This cretes the meta pointer, and this is not an offset pointer, hence the issue.
+    meta_ = details::meta_ptr<typename _Traits::meta>{
+        std::in_place_type<P>
+    };
+
     return *std::launder(reinterpret_cast<P*>(ptr_));
   }
 
